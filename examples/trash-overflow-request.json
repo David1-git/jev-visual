@@ -1,0 +1,17 @@
+{
+  "image": "/data/algorithm/tracking/InsVLM/rawdata/mall/shenwan/ch01006_20260802_121001_776_3_region.jpg",
+  "questions": {
+    "overflow": {
+      "type": "noul",
+      "instructions": "垃圾桶有没有满溢？"
+    },
+    "overflow_choice": {
+      "type": "choice",
+      "instructions": "请判断这个垃圾桶是否满溢？",
+      "criteria": {
+        "full": "垃圾桶已满，垃圾溢出",
+        "not_full": "垃圾桶未满，没有溢出"
+      }
+    }
+  }
+}
