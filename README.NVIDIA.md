@@ -310,18 +310,64 @@ torch.cuda.empty_cache()
 
 ### 这就是"取第一个 token"吗？
 
-**不是。** 关键区别：
+**不精确。** 关键在于区分 `prefill` 和 `decode` 两个阶段：
 
 ```
-完整生成（greedy）:
-  logits[step=0] → Yes → logits[step=1] → "es" → ... → "Yes"
+LLM 的两次前向（Forward）
 
-JEV (prefill picks=[last_pos]):
-  对完整 prefix（包括 <|im_end|>）做一次前向
-  → logits[last_pos] → [所有 151674 个 token 的概率]
+prefill（前缀填充）:
+  输入: [img_embed_1, img_embed_2, ..., text_emb_1, text_emb_2, ...]
+       shape: [1, 完整序列长度, 1536]
+
+  做一次 LLM 前向（28 层 attention）
+  输出: 
+    1. past_key_values = KV cache（28层 × 完整序列的 K/V）
+    2. out.logits = [1, 完整序列长度, 151674]
+                    每个位置对所有 vocab token 的概率分布
+
+decode（自回归解码）:
+  输入: [新 token 的 embedding] + past_key_values
+  输出: 
+    1. 新的 past_key_values（追加新 token 的 K/V）
+    2. logits[0][0] = 新 token 位置的分布
+
+  循环: 每生成一个 token，下一步就用它的 embedding + 更新后的 KV 再前向一次
 ```
 
-**JEV 的计算量 = 完整生成的第一次前向**（视觉编码 + 28层LLM），但跳过了后续 1-N 步的自回归解码。
+**JEV 只用了 prefill，没有用 decode：**
+
+```python
+# adapters_torch_finetuned.py 第 600-602 行
+last_pos = inputs['input_ids'].shape[1] - 1  # 序列最后一个位置 = "\n" 后面的生成位
+cache, position, logits = adapter.prefill(inputs, picks=[[last_pos]])
+#                           ↑
+#              prefill 返回的 logits shape = [1, 完整序列长度, 151674]
+#              picks=[[last_pos]] 只提取最后一列 = logits[0][last_pos]
+```
+
+```
+Greedy decode（完整生成）:
+  prefill → logits[last_pos] → token_A  ─┐
+                                          ↓
+  decode step 1: [token_A] + KV → logits → token_B  ─┐
+                                                       ↓
+  decode step 2: [token_A, token_B] + KV → logits → ...   ─→  完整回复
+
+JEV（只取 prefill 末尾的分布）:
+  prefill → logits[last_pos] → [所有 151674 个 token 的概率] → 直接取候选
+                                          ↑
+                                          停在这里，不再 decode
+```
+
+**为什么说"JEV 只解码第一个 token"不精确？**
+
+因为 JEV 根本没有做任何"解码"——没有把 token 喂回去做因果链。JEV 是直接取 prefill 末尾位置的 logits，当作第一个生成 token 的分布。
+
+**更准确的说法：**
+
+> JEV = 对完整 prefix 做一次 LLM 前向，直接取末尾位置的 logits，跳过整个 decode 自回归循环
+
+**JEV 的计算量 = Greedy decode 的第一次前向**（视觉编码 + 28层LLM），但完全跳过了后续 N 步的自回归解码。
 
 ### 为什么 JEV 能 work？（理论依据）
 
@@ -374,12 +420,16 @@ attn_weights = model.layers[-1].self_attn.attn_weights  # [1, seq_len, num_patch
 ### 总结
 
 ```
-JEV 不是什么：  ❌ 简单的"取第一个 token"
-               ❌ greedy decode（那是完整生成）
+JEV 不是什么：  ❌ 简单的"取第一个 token 的 id"
+               ❌ greedy decode（那需要完整的自回归循环）
 
-JEV 是什么：    ✅ 冻结 KV cache + 单步前缀解码
+JEV 是什么：    ✅ 冻结 KV + 单步前缀解码
                ✅ 一次 multimodal prefill + LM head 投影
                ✅ 候选集概率直接查表（O(1) per candidate）
+
+JEV 的本质：    prefill 末尾位置的 logits = 第一个生成 token 的分布
+               这个分布是 prefill（前缀填充）产生的，不是 decode（解码）产生的
+               JEV 跳过了 decode 循环，直接把这个分布拿来用
 
 JEV 能 work 的原因：
                ✅ 模型被训练成在 <|im_end|> 位置就"准备好"回答
@@ -388,7 +438,7 @@ JEV 能 work 的原因：
                ✅ 28层 LLM 的深层表示足够判别性
 
 JEV 的局限：
-               ⚠️ 假设"prefix 最后一层包含所有必要信息"
+               ⚠️ 假设"prefix 末尾的 hidden state 包含所有必要信息"
                ⚠️ 复杂任务（需要多步推理）可能需要完整生成
                ⚠️ 若 tokenizer 对齐改变，JEV 完全失效
 ```
