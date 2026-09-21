@@ -65,8 +65,7 @@ def tasks_for(plans):
     return tasks
 
 
-def score(adapter, prefix, image, plans, mode, batch_size):
-    mx = adapter.mx
+def score(adapter, prefix, images, plans, mode, batch_size):
     tasks = tasks_for(plans)
     scores = [[0.0] * len(plan.targets) for plan in plans]
     prefix_tokens = None
@@ -77,16 +76,16 @@ def score(adapter, prefix, image, plans, mode, batch_size):
         index, candidate, _, _, target = task
         if target is None:
             ids = [tokens[0] for tokens in plans[index].targets]
-            scores[index] = logits[0, ids].astype(mx.float32).tolist()
+            scores[index] = adapter.as_f32(logits[0, ids]).tolist()
         else:
             # DO NOT normalize over candidate tokens at intermediate positions.
-            normalizers = mx.logsumexp(logits.astype(mx.float32), axis=-1)
-            values = logits[mx.arange(len(target)), mx.array(target)] - normalizers
-            scores[index][candidate] = float(mx.sum(values).item())
+            normalizers = adapter.logsumexp(adapter.as_f32(logits), axis=-1)
+            values = logits[adapter.arange(len(target)), adapter.tensor(target)] - normalizers
+            scores[index][candidate] = float(adapter.sum(values).item())
         adapter.timings.scoring_ms += (time.perf_counter() - started) * 1000
 
     if mode == "shared":
-        inputs = adapter.prepare(prefix, image)
+        inputs = adapter.prepare(prefix, images)
         prefix_tokens = int(inputs["input_ids"].shape[-1])
         if any(prefix_tokens + len(task[2]) > 6000 for task in tasks):
             raise ValueError("image, question and candidate exceed 6000 tokens")
@@ -100,12 +99,12 @@ def score(adapter, prefix, image, plans, mode, batch_size):
     else:
         for task in tasks:
             index, _, row, picks, target = task
-            inputs = adapter.prepare(prefix + plans[index].suffix, image)
+            inputs = adapter.prepare(prefix + plans[index].suffix, images)
             full_length = int(inputs["input_ids"].shape[-1])
             offset = full_length - len(plans[index].suffix_ids)
             if target is not None:
-                inputs["input_ids"] = mx.concatenate([inputs["input_ids"], mx.array([target[:-1]])], axis=1)
-                inputs["attention_mask"] = mx.ones_like(inputs["input_ids"])
+                inputs["input_ids"] = adapter.cat([inputs["input_ids"], adapter.tensor([target[:-1]])], axis=1)
+                inputs["attention_mask"] = adapter.ones_like(inputs["input_ids"])
             if inputs["input_ids"].shape[-1] > 6000:
                 raise ValueError("image, question and candidate exceed 6000 tokens")
             _, _, logits = adapter.prefill(inputs, [[offset + p for p in picks]])

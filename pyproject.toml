@@ -11,6 +11,7 @@ dependencies = ["mlx-vlm==0.7.1", "mlx==0.32.2", "fastapi", "uvicorn", "pillow",
 
 [project.optional-dependencies]
 test = ["pytest", "httpx"]
+internvl = ["torch>=2.4", "transformers>=4.57", "accelerate", "pillow", "numpy"]
 
 [project.scripts]
 jev-visual = "jev_visual.cli:main"

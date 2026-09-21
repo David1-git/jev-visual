@@ -1,0 +1,12 @@
+# InternVL3 + NVIDIA GPU 后端依赖（替代 MLX 栈）
+# 安装: pip install -r requirements-internvl.txt
+# 需 Python >= 3.11；torch 请按官方指引安装 CUDA 版以获得 GPU 支持
+torch>=2.6
+transformers>=4.52
+accelerate>=1.5
+fastapi
+uvicorn
+pillow
+numpy
+pydantic>=2.10
+httpx

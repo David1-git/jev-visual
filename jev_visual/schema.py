@@ -2,7 +2,7 @@ import math
 from typing import Any, Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Question(BaseModel):
@@ -51,11 +51,27 @@ class Question(BaseModel):
 
 class Request(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    image: str = Field(min_length=1)
+    image: str | list[str] = Field(min_length=1)
     state: Any = ""
     questions: dict[str, Question] = Field(min_length=1, max_length=64)
     temperature: float = Field(default=1.0, gt=0, le=10, allow_inf_nan=False)
     mode: Literal["shared", "independent"] = "shared"
+
+    @field_validator("image")
+    @classmethod
+    def validate_image(cls, v):
+        if isinstance(v, list):
+            if not v or any(not isinstance(x, str) or not x.strip() for x in v):
+                raise ValueError("image list must be nonempty and contain nonempty strings")
+            return v
+        if not v.strip():
+            raise ValueError("image must be nonempty")
+        return v
+
+    @property
+    def images(self) -> list[str]:
+        """图像字段的规范化列表形式：单图 -> [str]，多图 -> list。"""
+        return self.image if isinstance(self.image, list) else [self.image]
 
 
 def answer(question: Question, logits: list[float], temperature: float):

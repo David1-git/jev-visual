@@ -38,18 +38,45 @@ class Qwen35Adapter:
         self.mx.reset_peak_memory()
         self.timings = Timings()
 
+    # ---- 后端无关算子（供 scoring.py 使用；InternVLAdapter 提供 torch 等价实现）----
+    def as_f32(self, x):
+        return x.astype(self.mx.float32)
+
+    def logsumexp(self, x, dim):
+        return self.mx.logsumexp(x, axis=dim)
+
+    def arange(self, n):
+        return self.mx.arange(n)
+
+    def tensor(self, seq):
+        return self.mx.array(seq)
+
+    def sum(self, x):
+        return self.mx.sum(x)
+
+    def cat(self, tensors, dim):
+        return self.mx.concatenate(tensors, axis=dim)
+
+    def ones_like(self, x):
+        return self.mx.ones_like(x)
+
+    def peak_memory_gb(self):
+        return self.mx.get_peak_memory() / 1e9
+
     def execution_context(self):
         # Match the memory residency policy used by MLX-VLM generate(). Without
         # this, a busy Mac can page scoring weights while the baseline pins them.
         from mlx_vlm.generate.common import wired_limit
         return wired_limit(self.model)
 
-    def prepare(self, prompt, image):
+    def prepare(self, prompt, images):
         from mlx_vlm.utils import prepare_inputs
         t = time.perf_counter()
-        inputs = prepare_inputs(self.processor, images=[image], prompts=prompt)
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+        inputs = prepare_inputs(self.processor, images=list(images), prompts=prompt)
         if inputs["input_ids"].shape[-1] > 6000:
-            raise ValueError("image and prompt exceed 6000 input tokens")
+            raise ValueError("images and prompt exceed 6000 input tokens")
         self.timings.preprocessing_ms += (time.perf_counter() - t) * 1000
         return inputs
 

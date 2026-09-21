@@ -14,13 +14,25 @@ from .schema import Request
 
 @asynccontextmanager
 async def lifespan(app):
-    from .engine import Engine
-    # MLX streams are thread-local. Load and infer on the SAME dedicated worker,
+    backend = os.environ.get("JEV_VISUAL_BACKEND", "mlx")
+    if backend == "mlx":
+        from .engine import Engine
+        factory = lambda path: Engine(path)
+    elif backend == "torch_internvl":
+        from .internvl import build_internvl_engine
+        factory = lambda path: build_internvl_engine(path)
+    elif backend == "torch_qwen35":
+        from .qwen35 import build_qwen35_engine
+        factory = lambda path: build_qwen35_engine(path)
+    else:
+        raise ValueError(f"unknown JEV_VISUAL_BACKEND: {backend}")
+    # MLX streams are thread-local; torch backends are thread-safe per request
+    # through Engine's lock. Load and infer on the SAME dedicated worker,
     # never on FastAPI's arbitrary request threadpool.
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="jev-visual") as executor:
         app.state.executor = executor
         app.state.engine = await asyncio.get_running_loop().run_in_executor(
-            executor, partial(Engine, os.environ.get("JEV_VISUAL_MODEL_PATH"))
+            executor, partial(factory, os.environ.get("JEV_VISUAL_MODEL_PATH"))
         )
         yield
 

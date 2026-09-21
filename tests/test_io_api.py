@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from jev_visual.engine import read_image
+from jev_visual.preprocessing import read_image
 from jev_visual.server import app
 
 

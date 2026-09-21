@@ -13,8 +13,8 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     data = json.loads(args.request.read_text())
-    if not data["image"].startswith("data:"):
-        data["image"] = str((args.request.resolve().parent / data["image"]).resolve())
+    from .preprocessing import resolve_image_paths
+    data = resolve_image_paths(data, args.request.resolve().parent)
     if args.mode:
         data["mode"] = args.mode
     request = Request.model_validate(data)

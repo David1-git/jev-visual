@@ -3,7 +3,7 @@ import threading
 import time
 
 from .adapters import MODEL_ID, MODEL_REVISION, load_adapter
-from .preprocessing import read_image, build_prompts
+from .preprocessing import read_images, build_prompts
 from .schema import Request, answer
 from .scoring import score
 
@@ -30,11 +30,11 @@ class Engine:
     def _judge(self, request, *, allow_path):
         self.adapter.reset()
         started = time.perf_counter()
-        image = read_image(request.image, allow_path=allow_path)
+        images = read_images(request.image, allow_path=allow_path)
         prefix, plans = build_prompts(self.processor, request)
         prepared = time.perf_counter()
         scores, prefix_tokens, token_lengths = score(
-            self.adapter, prefix, image, plans, request.mode, self.batch_size,
+            self.adapter, prefix, images, plans, request.mode, self.batch_size,
         )
         answers = {}
         for (key, question), values, plan in zip(request.questions.items(), scores, plans):
@@ -46,7 +46,7 @@ class Engine:
         elapsed = (time.perf_counter() - started) * 1000
         timings = self.adapter.timings.dict()
         return {
-            "model": MODEL_ID, "revision": self.revision, "model_source": self.model_source,
+            "model": self.model_source or MODEL_ID, "revision": self.revision, "model_source": self.model_source,
             "answers": answers,
             "probability_semantics": "normalized candidate probability conditional on supplied candidates; not calibrated",
             "metrics": {
@@ -54,7 +54,7 @@ class Engine:
                 "image_and_prompt_ms": (prepared - started) * 1000,
                 "suffix_ms": timings["scoring_ms"],
                 "prefix_tokens": prefix_tokens, "question_input_tokens": token_lengths,
-                "generated_tokens": 0, "peak_metal_memory_gb": self.mx.get_peak_memory() / 1e9,
+                "generated_tokens": 0, "peak_memory_gb": self.adapter.peak_memory_gb(),
                 "decisions_per_second": len(plans) * 1000 / elapsed,
             },
         }
