@@ -1,129 +1,247 @@
 # jev-visual → NVIDIA GPU 移植版（InternVL3-2B / Qwen3.5-2B）
 
 原项目 `hr98w/jev-visual` 只在 **Apple Silicon / MLX / Qwen3.5-0.8B-4bit** 上验证过。
-本目录是它的 **NVIDIA GPU / PyTorch / transformers** 移植：共享 prefill → fork 缓存 →
-批量问题后缀 → 候选打分，逻辑不变，只换模型后端。**两个适配器都已写好**，换权重即可跑。
 
-## 目录与新增文件
+本目录是它的 **NVIDIA GPU / PyTorch / transformers** 移植。核心改动：把 MLX 适配器替换为 PyTorch + transformers + 真实微调权重（InternVL3-2B 权重），适配 AIBEE 场景（商场垃圾分类/杂物检测）的评测流程。
 
-| 文件 | 作用 |
-| --- | --- |
-| `jev_visual/adapters_torch_internvl.py` | InternVL3 适配器（`InternVLAdapter`）+ 加载函数 |
-| `jev_visual/adapters_torch_qwen35.py` | Qwen3.5-2B 适配器（`Qwen35TorchAdapter`）+ 加载函数 |
-| `jev_visual/internvl.py` | InternVL3 引擎工厂 + CLI（`python -m jev_visual.internvl_run`） |
-| `jev_visual/qwen35.py` | Qwen3.5-2B 引擎工厂 + CLI（`python -m jev_visual.qwen35_run`） |
-| `examples/verify_scoring_torch.py` | **GPU 验收脚本**（oracle 对拍，判断"移植是否数值正确"） |
-| `requirements-internvl.txt` | NVIDIA 后端依赖 |
-| `tests/test_internvl_adapter.py` | InternVL 适配器 mock 测试（无需 GPU/权重） |
-| `tests/test_qwen35_adapter.py` | Qwen3.5 适配器 mock 测试（无需 GPU/权重） |
-| `tests/test_multimage.py` | 多图支持测试（schema/解码/prompt/适配器/引擎，无需 GPU/权重） |
-| `examples/usage_internvl3.py` | InternVL3-2B 可运行示例（`--multi` 多图模式） |
-| `examples/usage_qwen35.py` | Qwen3.5-2B 可运行示例（`--multi` 多图模式） |
+## 目录结构
 
-后端无关化改造（原 MLX 版仍可用）：`scoring.py` 用 `adapter.*` 算子、
-`engine.py` 用 `adapter.peak_memory_gb()`、`preprocessing.py` 按 processor 能力传模板参数、
-`adapters.py` 的 `Qwen35Adapter` 补齐同一套算子、`server.py` 支持 `JEV_VISUAL_BACKEND`。
+```
+jev-vision/
+├── README.md / README.zh-CN.md   # 原版 Apple Silicon README
+├── README.NVIDIA.md              # 本文件：NVIDIA GPU 移植说明
+├── THIRD_PARTY.md
+│
+├── jev_visual/                   # 核心推理引擎
+│   ├── __init__.py               # 统一导出
+│   ├── adapters.py               # 抽象基类（MLX/Torch 共享接口）
+│   ├── adapters_torch_finetuned.py  # ★ 核心：微调 InternVL3-2B 适配器（VIP/PIL/前缀/打分为一体）
+│   ├── adapters_torch_internvl.py   # 基础 InternVL3-2B（非微调）适配器
+│   ├── adapters_torch_qwen35.py     # Qwen3.5-2B 适配器
+│   ├── engine.py                # 引擎：请求 → 适配器调用 → 结果组装
+│   ├── preprocessing.py         # 请求解析 / prompt 构造 / schema 校验
+│   ├── scoring.py               # 打分：候选概率归一化 / A/B/C 标签 / EOS 处理
+│   ├── schema.py                # 结果类型定义（choice / noul / score / struct）
+│   ├── cli.py                   # 命令行入口
+│   ├── server.py                # FastAPI HTTP 服务
+│   ├── download.py              # 权重下载工具
+│   ├── internvl.py              # InternVL 引擎工厂 + CLI
+│   └── qwen35.py                # Qwen3.5 引擎工厂 + CLI
+│
+├── examples/
+│   ├── photo-request.json       # 单图示例请求
+│   ├── trash-overflow-request.json  # 杂物溢出检测示例
+│   ├── convert_val_to_requests.py   # ★ val 数据集 → 结构化请求文件（jsonl）
+│   ├── eval_val_requests.py          # ★ 全量评测脚本（910条 CHOICE + NOUL）
+│   ├── evaluate.py                  # 旧版评测入口
+│   ├── usage_internvl3.py           # InternVL3 使用示例
+│   ├── usage_qwen35.py              # Qwen3.5 使用示例
+│   ├── verify_scoring_torch.py      # GPU 验收脚本（适配器 vs 原生打分对拍）
+│   ├── verify_scoring.py            # 原版（MLX）对拍脚本
+│   └── http_smoke.py                # HTTP 服务冒烟测试
+│
+├── tests/                        # pytest 单元测试（无需 GPU/权重）
+│   ├── test_internvl_adapter.py
+│   ├── test_qwen35_adapter.py
+│   ├── test_multimage.py
+│   ├── test_scoring.py
+│   ├── test_schema.py
+│   └── test_io_api.py
+│
+├── benchmarks/                   # 性能 Benchmark（原版 MLX）
+├── demo/                         # 可视化 Demo（原版）
+└── docs/                         # 文档（原版）
+```
 
-## 快速开始（NVIDIA GPU 机器）
+## 快速开始（NVIDIA GPU）
+
+### 1. 安装依赖
 
 ```bash
-# 1. 安装依赖（torch 请按官方指引装 CUDA 版）
 pip install -r requirements-internvl.txt
-
-# 2. 可选：先跑无需 GPU/权重的适配器逻辑测试
-python -m pytest tests/test_internvl_adapter.py tests/test_qwen35_adapter.py -q
-
-# 3a. 命令行跑一个请求（InternVL3-2B）
-python -m jev_visual.internvl_run examples/photo-request.json \
-    --model-path OpenGVLab/InternVL3-2B-hf --device cuda
-
-# 3b. 命令行跑一个请求（Qwen3.5-2B）
-python -m jev_visual.qwen35_run examples/photo-request.json \
-    --model-path Qwen/Qwen3.5-2B --device cuda
-
-# 4. GPU 数值验收（两个模型都跑；这是"移植是否正确"的判据）
-python examples/verify_scoring_torch.py --backend internvl --model-path OpenGVLab/InternVL3-2B-hf
-python examples/verify_scoring_torch.py --backend qwen35   --model-path Qwen/Qwen3.5-2B
-
-# 5. 或启动 HTTP 服务（FastAPI，与原接口一致）
-JEV_VISUAL_BACKEND=torch_internvl \
-JEV_VISUAL_MODEL_PATH=OpenGVLab/InternVL3-2B-hf \
-  uvicorn jev_visual.server:app --host 127.0.0.1 --port 8788
-# 换成 Qwen3.5: JEV_VISUAL_BACKEND=torch_qwen35 JEV_VISUAL_MODEL_PATH=Qwen/Qwen3.5-2B
 ```
 
-## 多图支持（v2 新增）
-
-单图与多图完全兼容：`image` 字段传**字符串 = 单图**，传**数组 = 多图**（HTTP JSON 同理）。
+### 2. 运行单次请求
 
 ```bash
-# 命令行（CLI 的 image 数组自动解析相对路径）
-python -m jev_visual.internvl_run examples/multi-request.json --model-path OpenGVLab/InternVL3-2B-hf
+# InternVL3-2B 微调权重（杂物检测）
+MODEL_PATH=/data/algorithm/user/rzli/InternVL3/work_dirs/internvl_chat_v3/internvl3_2b_dynamic_res_2nd_finetune_full-aibee_inspect2_internvl3_260909_regen_fall_cart_clutter_clean_0909
 
-# 示例脚本加 --multi（两图：蓝色圆形 + 蓝色方形）
-python examples/usage_internvl3.py --multi --model-path OpenGVLab/InternVL3-2B-hf
-python examples/usage_qwen35.py    --multi --model-path Qwen/Qwen3.5-2B
+python3 -m jev_visual.internvl_run examples/trash-overflow-request.json \
+    --model-path "$MODEL_PATH" --device cuda
+
+# 基础 InternVL3-2B（非微调）
+python3 -m jev_visual.internvl_run examples/photo-request.json \
+    --model-path OpenGVLab/InternVL3-2B-hf --device cuda
 ```
+
+### 3. 全量评测（910 条验证集）
+
+```bash
+# 步骤 1: 转换 val 数据集 → 请求文件（jsonl）
+python3 examples/convert_val_to_requests.py \
+    --val-json /path/to/val.json \
+    --output-dir /tmp
+
+# 步骤 2: 全量评测（会自动找到空闲显存最大的 GPU）
+python3 examples/eval_val_requests.py \
+    --choice-jsonl /tmp/val_clutter_choice.jsonl \
+    --noul-jsonl /tmp/val_clutter_noul.jsonl \
+    --output /tmp/eval_full_results.json \
+    --device cuda:3   # 指定 GPU（显存紧张的机器上必选）
+```
+
+输出示例：
+
+```
+======================================================================
+  风格: CHOICE
+======================================================================
+  总样本数: 910  (跳过: 0)
+  Overall Accuracy: 625/910 = 0.6868
+
+  Confusion Matrix (rows=GT, cols=Pred):
+              Pred=Yes   Pred=No
+  GT=Yes           281       174
+  GT=No            111       344
+
+          类别  support         P         R        F1
+         Yes      455    0.7168    0.6176    0.6635
+          No      455    0.6641    0.7560    0.7071
+       Macro F1                            0.6853
+
+======================================================================
+  风格: NOUL
+======================================================================
+  总样本数: 894  (跳过: 0)
+  Overall Accuracy: 616/894 = 0.6890
+
+         Yes      455    0.6725    0.7582    0.7128
+          No      439    0.7113    0.6173    0.6610
+       Macro F1                            0.6869
+```
+
+### 4. 启动 HTTP 服务
+
+```bash
+MODEL_PATH=/data/algorithm/user/rzli/InternVL3/work_dirs/internvl_chat_v3/internvl3_2b_dynamic_res_2nd_finetune_full-aibee_inspect2_internvl3_260909_regen_fall_cart_clutter_clean_0909
+
+JEV_VISUAL_BACKEND=torch_finetuned \
+    JEV_VISUAL_MODEL_PATH="$MODEL_PATH" \
+    uvicorn jev_visual.server:app --host 127.0.0.1 --port 8788
+```
+
+### 5. 适配器数值验收
+
+```bash
+# 对拍：Finetuned 适配器的 logits 与 transformers 原生接口是否一致
+python examples/verify_scoring_torch.py \
+    --backend torch_finetuned \
+    --model-path "$MODEL_PATH"
+```
+
+## 适配器体系
+
+项目有 **三个** PyTorch 适配器，从底层到顶层：
+
+| 适配器 | 文件 | 用途 | 依赖 |
+|--------|------|------|------|
+| `InternVLAdapter` | `adapters_torch_internvl.py` | 基础 InternVL3-2B（非微调） | `OpenGVLab/InternVL3-2B-hf` |
+| `Qwen35TorchAdapter` | `adapters_torch_qwen35.py` | Qwen3.5-2B | `Qwen/Qwen3.5-2B` |
+| `FinetunedInternVLAdapter` | `adapters_torch_finetuned.py` | **微调 InternVL3-2B（AIBEE 场景）** | 自定义微调权重路径 |
+
+### FinetunedInternVLAdapter 核心接口
+
+```python
+from jev_visual.adapters_torch_finetuned import load_finetuned_adapter
+
+# 加载（device="cuda:3" 或 "cuda"，单卡）
+adapter, model_path, source = load_finetuned_adapter(
+    model_path="/path/to/finetuned/weights",
+    device="cuda:3"
+)
+
+# 单图请求（choice 模式）
+inputs = adapter.prepare(prompt, [image])
+cache, position, logits = adapter.prefill(inputs, picks=[[-1]])  # picks 位置 = <|im_end|> 后
+probs = torch.softmax(logits[0][0].float(), dim=-1)
+yes_prob = probs[tokenizer.encode("Yes")[0]]
+
+# 多图请求
+inputs = adapter.prepare(prompt, [img1, img2, img3])
+```
+
+## GPU 显存管理
+
+InternVL3-2B bf16 权重约 **4.8 GB**，加上 KV cache 和推理临时张量，建议 **≥12GB 显存**。
+
+**显存紧张时的策略**：
+
+```python
+# 1. 指定单卡（避免和其他任务抢）
+--device cuda:3
+
+# 2. 周期性清理（eval_val_requests.py 已内置）
+torch.cuda.empty_cache()  # 每 50 条调用一次
+
+# 3. 推理后主动 del 中间变量
+del inputs, cache, position, logits, probs
+torch.cuda.empty_cache()
+```
+
+## 请求格式
+
+### choice 模式（多选项）
 
 ```json
 {
-  "image": ["examples/blue-circle.png", "examples/blue-square.png"],
+  "image": "/path/to/image.jpg",
   "questions": {
-    "first":  {"type": "choice", "instructions": "第一张图是什么形状？",
-               "criteria": {"circle": "圆形", "square": "方形"},
-               "scoring": "single_token", "candidates": {"circle": "circle", "square": "square"}},
-    "second": {"type": "choice", "instructions": "第二张图是什么形状？",
-               "criteria": {"circle": "圆形", "square": "方形"},
-               "scoring": "single_token", "candidates": {"circle": "circle", "square": "square"}}
+    "main": {
+      "type": "choice",
+      "instructions": "图中是否有杂物溢出？",
+      "criteria": {
+        "A": "有杂物溢出",
+        "B": "没有杂物溢出"
+      },
+      "scoring": "single_token",
+      "candidates": {"A": "A", "B": "B"}
+    }
   }
 }
 ```
 
-多图实现：schema 字段放宽 → 每张图放一个图像占位条目 → processor 一次编码多图
-（Qwen3.5 的 `image_grid_thw` 形状 `(num_images, 3)`；InternVL3 的 `pixel_values` batch 维 = 图像数）。
-**suffix/fork/打分逻辑零改动**——图像占位符全在 prefix 里，共享缓存机制天然支持。
-多图数值正确性由 `verify_scoring_torch.py` 的两图对拍用例判定（GPU 上跑）。
+### noul 模式（Yes/No 判断）
 
-## 权重
+```json
+{
+  "image": "/path/to/image.jpg",
+  "questions": {
+    "main": {
+      "type": "noul",
+      "instructions": "图中是否有杂物溢出？",
+      "criteria": {},
+      "scoring": "single_token",
+      "candidates": {}
+    }
+  }
+}
+```
 
-- InternVL3-2B：`OpenGVLab/InternVL3-2B-hf`（非量化 bf16，~4.2GB；HuggingFace / ModelScope 同名）
-- Qwen3.5-2B：`Qwen/Qwen3.5-2B`（非量化 bf16，~4.5GB；HuggingFace / ModelScope 同名）
+### 多图模式
 
-首次运行自动下载；也可先手动下载后把 `--model-path` 指到本地目录。
-**显存需求：2B 模型 bf16 加载约 4–5GB，另有前缀 KV 缓存，建议 ≥12GB 显存。**
+```json
+{
+  "image": ["/path/to/img1.jpg", "/path/to/img2.jpg"],
+  "questions": { ... }
+}
+```
 
-## GPU 实测点（TODO-VERIFY，跑 `verify_scoring_torch.py` 时确认）
+## 多图支持
 
-适配器基于 transformers 源码与官方模型卡编写。**已完成的不依赖 GPU 的验证**：
+单图与多图完全兼容：`image` 字段传**字符串 = 单图**，传**数组 = 多图**（HTTP JSON 同理）。
 
-- `pytest` 全量 **43/43 通过**（原仓库 14 + 两个新适配器 mock 各 10 = 20 + 多图支持 9）
-- 多图链路（mock）：schema 接受/拒绝、多图解码与 768 上限、每图一个占位条目、
-  两个适配器 prepare 收到列表、engine 全链路（schema → read_images → build_prompts → prepare）
-- 用 **真实 transformers 5.17** 拉取两模型 config 验证：
-  - `Qwen/Qwen3.5-2B` 的 `DynamicCache` = **18 个 LinearAttentionLayer + 6 个 DynamicLayer**
-    （混合架构），`fork()` 逐层复制 conv/recurrent states 与 keys/values，batch 1→4 全部正确、
-    原 cache 未被污染、`_seen_tokens` 保留
-  - `OpenGVLab/InternVL3-2B-hf` 的 `DynamicCache` = **28 个 DynamicLayer**（纯 attention），fork 正确
-  - 两个模型均已注册在 `AutoModelForImageTextToText` 映射表内
-
-**仍需你那边（NVIDIA GPU）实测的点**（脚本会断言，未通过会报错并写
-`artifacts/scoring-verification-torch.json`）：
-
-1. `processor(images=[...], text=渲染后prefix)` 的图像占位符识别与展开数量
-   （InternVL3: `<IMG_CONTEXT>` → 每 patch 256 token × tile 数；Qwen3.5: `<|image_pad|>` 族）。
-   若占位符不被识别，`prepare()` 里需把占位串替换为 processor 认识的记号（已注释标注）。
-2. 混合缓存 fork 在真实模型 prefill 后（`has_previous_state` 等标志置位后）的行为。
-3. 续写时 `position_ids` 处理：InternVL3 显式从 `next_position` 起算；
-   Qwen3.5 传 None 由模型从 cache 长度自动续算 mrope 位置。
-4. suffix 右 padding + 当前段 attention_mask 的数值正确性（对拍判据）。
-5. **多图**（新）：占位符数量/顺序与图数量对应（两图对拍用例覆盖）、
-   InternVL3 的 `max_patches=12` 是每图还是合计上限、多图 cache fork 后图像嵌入位置。
-
-## 已知边界（诚实声明）
-
-- 本移植未在真实 GPU 上执行过；`verify_scoring_torch.py` 通过 = 移植数值正确。
-- 原 MLX 版代码保留可用（`python -m pytest` 原 14 个测试仍通过）。
-- 概率语义与原项目一致：候选概率相对于提供的选项归一化，**非校准**。
+实现：schema 字段放宽 → 每张图放一个图像占位条目 → `FinetunedInternVLAdapter.prepare()` 一次编码多图。`image_flags` / `pixel_values` 的 batch 维 = 图像数。`suffix` / `fork` / 打分逻辑零改动——图像占位符全在 prefix 里，共享缓存机制天然支持。
 
 ## JEV 原理：单步前缀解码（Single-step Prefix Decoding）
 
@@ -143,7 +261,7 @@ python examples/usage_qwen35.py    --multi --model-path Qwen/Qwen3.5-2B
   ──────────────────────────────────────────────────────────────────────
 
 [Step 2] adapter.prefill(inputs, picks=[[last_pos]]) ──────────────────
-  • 输入: 完整的 multimodal input_embeds（含 2 张图）
+  • 输入: 完整的 multimodal input_embeds（含多张图）
   • 前向:
       ViT encoder: image → vit_embeds
       Qwen2.5-2B (28层, hidden=1536):
@@ -167,7 +285,7 @@ python examples/usage_qwen35.py    --multi --model-path Qwen/Qwen3.5-2B
 
 [Step 4] 候选 token 概率提取 ─────────────────────────────────────────
   Choice 模式:
-    对每个选项 (Yes, No):
+    对每个选项 (A, B):
       token_id = tokenizer.encode(option) 的第一个 token
       prob = P[token_id]
       e.g. Yes→9454, No→2753
@@ -274,3 +392,89 @@ JEV 的局限：
                ⚠️ 复杂任务（需要多步推理）可能需要完整生成
                ⚠️ 若 tokenizer 对齐改变，JEV 完全失效
 ```
+
+## 全量评测结果
+
+评测配置：InternVL3-2B 微调权重，val 验证集 910 条，CHOICE + NOUL 两种 prompt 风格。
+
+### CHOICE（完整 910 条）
+
+```
+Overall Accuracy: 625/910 = 68.68%
+
+Confusion Matrix (rows=GT, cols=Pred):
+              Pred=Yes   Pred=No
+  GT=Yes           281       174      ← Recall_Yes = 61.8%（漏检 174 个）
+  GT=No            111       344      ← FP = 111
+
+         类别  support         P         R        F1
+         Yes      455    0.7168    0.6176    0.6635
+          No      455    0.6641    0.7560    0.7071
+       Macro F1                            0.6853
+```
+
+### NOUL（有效 894/910，16 条显存 OOM 跳过）
+
+```
+Overall Accuracy: 616/894 = 68.90%
+
+         Yes      455    0.6725    0.7582    0.7128
+          No      439    0.7113    0.6173    0.6610
+       Macro F1                            0.6869
+```
+
+### 综合对比
+
+| 指标           | CHOICE | NOUL  |
+| -------------- | ------ | ----- |
+| Accuracy       | 0.6868 | 0.6890 |
+| Precision (Yes) | **0.7168** | 0.6725 |
+| Recall (Yes)   | 0.6176 | **0.7582** |
+| F1 (Yes)       | 0.6635 | **0.7128** |
+| Precision (No) | 0.6641 | **0.7113** |
+| Recall (No)    | **0.7560** | 0.6173 |
+| F1 (No)        | **0.7071** | 0.6610 |
+| Macro F1       | 0.6853 | **0.6869** |
+
+**结论**：
+- Macro F1 几乎打平（68.53% vs 68.69%）
+- **CHOICE 偏向保守**（Recall_Yes=61.8%，倾向说 No，漏检多）
+- **NOUL 偏向激进**（Recall_Yes=75.8%，倾向说 Yes，误报多）
+- 业务选型：漏报成本高 → NOUL；误报成本高 → CHOICE
+
+## 单元测试
+
+测试无需 GPU 和模型权重：
+
+```bash
+# 全部测试
+python -m pytest tests/ -q
+
+# 单个测试文件
+python -m pytest tests/test_internvl_adapter.py -v
+python -m pytest tests/test_qwen35_adapter.py -v
+python -m pytest tests/test_multimage.py -v
+```
+
+已验证：
+- Finetuned 适配器 mock 测试
+- InternVL 适配器 mock 测试
+- Qwen3.5 适配器 mock 测试
+- 多图链路（schema / prepare / engine 全链路）
+- 打分逻辑（single_token / A/B/C 标签 / EOS）
+- Schema 校验
+
+## 权重
+
+| 模型 | 路径 | 显存 | 用途 |
+|------|------|------|------|
+| InternVL3-2B 微调 | `.../internvl3_2b_dynamic_res_2nd_finetune_full-aibee_inspect2_internvl3_260909_regen_fall_cart_clutter_clean_0909` | ~4.8GB bf16 | 杂物检测主模型 |
+| InternVL3-2B 原版 | `OpenGVLab/InternVL3-2B-hf` | ~4.2GB bf16 | 对照基线 |
+| Qwen3.5-2B | `Qwen/Qwen3.5-2B` | ~4.5GB bf16 | 对照实验 |
+
+## 已知边界
+
+- 显存紧张时需指定 `--device` 避免抢占其他任务
+- NOUL 模式显存占用略高（prompt 更长），极端情况下可能 OOM
+- 概率语义与原项目一致：候选概率相对于提供的选项归一化，**非校准**
+- 原 MLX 版代码保留可用
